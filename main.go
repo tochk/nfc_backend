@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -33,13 +34,15 @@ var config struct {
 }
 
 type UserInfo struct {
-	Id       int `db:"id" json:"id"`
+	Id       int    `db:"id" json:"id"`
 	FullName string `db:"full_name" json:"full_name"`
 	Position string `db:"position" json:"position"`
 	IsStart  string `db:"is_start" json:"is_start"`
 }
+
 type Statistics struct {
-	FullName string `db:"fullName"`
+	Id       int      `db:"userId"`
+	FullName string   `db:"fullName"`
 	Time     *float64 `db:"time"`
 }
 
@@ -48,13 +51,11 @@ type UserStatus struct {
 }
 
 type StatisticsPage struct {
-	Statistics []Statistics
-	NextDate   string
-	CurrentDate   string
-	PrevDate   string
-}
-
-type SubmitData struct {
+	Statistics  []Statistics
+	NextDate    string
+	CurrentDate string
+	PrevDate    string
+	Keyword     string
 }
 
 func loadConfig(path string) error {
@@ -110,9 +111,22 @@ func (s *server) submitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *server) indexHandler(w http.ResponseWriter, r *http.Request) {
+	index, err := template.ParseFiles("templates/index.html")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	if err := index.Execute(w, nil); err != nil {
+		log.Println(err)
+		return
+	}
+}
+
 func (s *server) statisticsHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Loaded %s page from %s", r.URL.Path, r.RemoteAddr)
-	date := r.URL.Path[len("/statistics/"):]
+	url := strings.Split(r.URL.Path, "/")
+	date := url[3]
 	var err error
 	var pageDate time.Time
 	if date == "" {
@@ -129,7 +143,12 @@ func (s *server) statisticsHandler(w http.ResponseWriter, r *http.Request) {
 		pageDate = pageDate.Add(-time.Hour * 24)
 	}
 	stat := make([]Statistics, 0)
-	if err := s.Db.Select(&stat, " SELECT (SELECT CONCAT(firstName, ' ', lastName) FROM users WHERE id = schedule.userId) as fullName , sum(TO_SECONDS(`endTime`) - TO_SECONDS(`startTime`)) / 3600 as time FROM schedule WHERE DATE(startTime) >= ? AND DATE(startTime) <= ? GROUP BY userId;", pageDate.Format("2006-01-02"), pageDate.Add(time.Hour * 24 * 6).Format("2006-01-02")); err != nil {
+	if err := s.Db.Select(&stat, "SELECT (SELECT CONCAT(firstName, ' ', lastName) FROM users WHERE id = schedule.userId) as fullName, userId, sum(TO_SECONDS(`endTime`) - TO_SECONDS(`startTime`)) / 3600 as time FROM schedule WHERE DATE(startTime) >= ? AND DATE(startTime) <= ? GROUP BY userId;", pageDate.Format("2006-01-02"), pageDate.Add(time.Hour * 24 * 6).Format("2006-01-02")); err != nil {
+		log.Println(err)
+		return
+	}
+	users := make([]UserStatus, 0)
+	if err := s.Db.Select(&users, "SELECT id FROM users WHERE departmentId = (SELECT id FROM departments WHERE keyword = ?)", url[2]); err != nil {
 		log.Println(err)
 		return
 	}
@@ -139,24 +158,31 @@ func (s *server) statisticsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stat = sortUsersByTime(stat)
+	stat = sortUsersByTime(stat, users)
 
 	if err := testTemplate.Execute(w, StatisticsPage{
-		Statistics: stat,
-		PrevDate:   pageDate.Add(-time.Hour * 24 * 7).Format("2006-01-02"),
-		CurrentDate:pageDate.Format("2006-01-02"),
-		NextDate:   pageDate.Add(time.Hour * 24 * 7).Format("2006-01-02"),
+		Statistics:  stat,
+		PrevDate:    pageDate.Add(-time.Hour * 24 * 7).Format("2006-01-02"),
+		CurrentDate: pageDate.Format("2006-01-02"),
+		NextDate:    pageDate.Add(time.Hour * 24 * 7).Format("2006-01-02"),
+		Keyword:     url[2],
 	}); err != nil {
 		log.Println(err)
 		return
 	}
 }
 
-func sortUsersByTime(stat []Statistics) []Statistics {
+func sortUsersByTime(stat []Statistics, users []UserStatus) []Statistics {
 	newStat := make([]Statistics, 0)
 	for _, e := range stat {
 		if e.Time != nil {
-			newStat = append(newStat, e)
+			for _, e2 := range users {
+				if e.Id == e2.Id {
+					newStat = append(newStat, e)
+					break
+				}
+			}
+
 		}
 	}
 	stat = newStat
@@ -167,9 +193,9 @@ func sortUsersByTime(stat []Statistics) []Statistics {
 			}
 		}
 	}
+
 	return stat
 }
-
 
 func (s *server) clearDate() {
 	for {
@@ -197,6 +223,8 @@ func main() {
 	log.Printf("Connected to database on %s", config.MysqlHost)
 	fs := http.FileServer(http.Dir("static"))
 	http.Handle("/static/", http.StripPrefix("/static/", fs))
+
+	http.HandleFunc("/", s.indexHandler)
 	http.HandleFunc("/submit/", s.submitHandler)
 	http.HandleFunc("/statistics/", s.statisticsHandler)
 
